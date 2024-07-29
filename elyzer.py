@@ -49,15 +49,36 @@ def getFields(filename):
         fields.append(j + ":")
     return fields
 
-def resolveIP(domain):
+def resolveIP(domain, passive=False):
+    if passive:
+        print(f'{Fore.LIGHTYELLOW_EX}Skipping DNS resolution for {domain} due to passive mode.{Fore.RESET}')
+        return 'Passive DNS lookup skipped'
     try:
         resolve4 = dns.resolver.resolve(domain, 'A')
         if resolve4:
             for resolved4 in resolve4:
                 return f'{resolved4}'
-    except:
-        return f'{Fore.LIGHTRED_EX}Error.{Fore.RESET}'
-    
+    except Exception as e:
+        return f'{Fore.LIGHTRED_EX}Error: {e}.{Fore.RESET}'
+
+
+def passive_dns_query(domain, api_key):
+    url = f"https://api.passivetotal.org/v2/dns/passive?query={domain}"
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        if data['success']:
+            for record in data['results']:
+                if record['resolveType'] == 'A':
+                    return record['resolve']
+    except Exception as e:
+        print(f'{Fore.LIGHTRED_EX}Passive DNS query failed: {e}{Fore.RESET}')
+    return None
+
 def routing(eHeader):
     routing =[]
     counter= 0
@@ -140,8 +161,11 @@ def generalInformation(eheader):
         decodedHeader = ''
         for part, charset in decoded_subject:
             try:
-                decodedHeader += part.decode(charset or 'utf8') if isinstance(part, bytes) else part
-            except UnicodeDecodeError:
+                if isinstance(part, bytes):
+                    decodedHeader += part.decode(charset or 'utf8')
+                else:
+                    decodedHeader += part
+            except (LookupError, UnicodeDecodeError):
                 decodedHeader += part.decode('iso-8859-1') if isinstance(part, bytes) else part
     else:
         decodedHeader = None
@@ -157,6 +181,7 @@ def generalInformation(eheader):
     gInformation.append(f'From: {content["from"]}\n' + f'To: {content["to"]}\n' + f'Subject: {decodedHeader}\n' + f'Date: {content["date"]}\n')
     
     return ''.join(gInformation)
+
 
 def securityInformations(eheader):
     try:
@@ -343,7 +368,10 @@ def envelope(eheader):
 
     return '\n'.join(eenvelope)
 
-def spoofing(eheader):
+import re
+import ipaddress
+
+def spoofing(eheader, passive=False):
     report = []
 
     try:
@@ -356,10 +384,21 @@ def spoofing(eheader):
     print(f'\n{Fore.LIGHTBLUE_EX}Spoofing Check: {Fore.RESET}')
     report.append(f'\nSpoofing Check:\n')
 
-    x = next(iter(reversed(getReceivedFields(eheader))), None)
+    received_fields = getReceivedFields(eheader)
+    if not received_fields:
+        print(f'{Fore.RED}No received fields found in the email header.{Fore.RESET}')
+        report.append('No received fields found in the email header.\n')
+        return ''.join(report)
+
+    x = next(iter(reversed(received_fields)), None)
+    if not x:
+        print(f'{Fore.RED}No received field to analyze.{Fore.RESET}')
+        report.append('No received field to analyze.\n')
+        return ''.join(report)
+
     ipv4 = re.findall(r'[\[\(](\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[\]\)]', x, re.IGNORECASE)
     ipv6 = re.findall(r'[\[\(]([A-Fa-f0-9:]+)[\]\)]', x, re.IGNORECASE)
-    filteredIpv4 = [ip for ip in ipv4 if ip != '127.0.0.1']
+    filteredIpv4 = [ip for ip in ipv4 if not ipaddress.ip_address(ip).is_private]
 
     formatReturnPath = False
     formatReplyTo = False
@@ -383,21 +422,35 @@ def spoofing(eheader):
     authResultOrigIP = None
 
     fromEmailDomain = fromMatch.group(1).split('@')[1]
-    try:
-        getMx = dns.resolver.resolve(fromEmailDomain, 'MX')
-        for servers in getMx:
-            mx.append(servers.exchange.to_text().lower())
+    if not passive:
+        try:
+            getMx = dns.resolver.resolve(fromEmailDomain, 'MX')
+            for servers in getMx:
+                mx.append(servers.exchange.to_text().lower())
 
-    except (dns.resolver.LifetimeTimeout, dns.resolver.NoAnswer,dns.resolver.NXDOMAIN,dns.resolver.YXDOMAIN,dns.resolver.NoNameservers):
-        print(f'{Fore.LIGHTRED_EX}Could not resolve the MX Record.{Fore.RESET}')
-    for servers in mx:
-        aRecordsOfMx.append(resolveIP(servers))
-                 
+        except (dns.resolver.LifetimeTimeout, dns.resolver.NoAnswer,dns.resolver.NXDOMAIN,dns.resolver.YXDOMAIN,dns.resolver.NoNameservers) as e:
+            print(f'{Fore.LIGHTRED_EX}Could not resolve the MX Record: {e}{Fore.RESET}')
+            report.append(f'Could not resolve the MX Record: {e}\n')
+        for servers in mx:
+            resolved_ip = resolveIP(servers, passive)
+            if resolved_ip != f'{Fore.LIGHTRED_EX}Error.{Fore.RESET}':
+                aRecordsOfMx.append(resolved_ip)
+            else:
+                print(f'{Fore.LIGHTRED_EX}Error resolving IP for MX server: {servers}{Fore.RESET}')
+                report.append(f'Error resolving IP for MX server: {servers}\n')
+        
+        if not aRecordsOfMx:
+            print(f'{Fore.LIGHTRED_EX}No A records found for MX servers.{Fore.RESET}')
+            report.append('No A records found for MX servers.\n')
+    
     print(f'\n{Fore.LIGHTMAGENTA_EX}Checking for SMTP Server Mismatch...{Fore.RESET}')
     report.append('\nChecking for SMTP Server Mismatch...\n')  
 
     if filteredIpv4:
-        if filteredIpv4[0] in aRecordsOfMx:
+        if passive:
+            print(f'{Fore.LIGHTYELLOW_EX}Passive mode enabled, skipping detailed SMTP server mismatch check.{Fore.RESET}')
+            report.append(f'Passive mode enabled, skipping detailed SMTP server mismatch check.\n')
+        elif filteredIpv4[0] in aRecordsOfMx:
             print(f'{Fore.LIGHTGREEN_EX}No Mismatch detected.{Fore.RESET}')
             report.append(f'No Mismatch detected.')
         else:
@@ -408,14 +461,14 @@ def spoofing(eheader):
             authResultsOrigin = re.findall(r'sender IP is ([\d.]+)', content['Authentication-Results-Original'], re.IGNORECASE)
             if authResultsOrigin:
                 ipv4 = authResultsOrigin
-                authResultOrigIP = [ip for ip in ipv4 if ip != '127.0.0.1']
+                authResultOrigIP = [ip for ip in ipv4 if not ipaddress.ip_address(ip).is_private]
                 try:
                     authResultOrigDomain = dns.resolver.resolve(dns.reversename.from_address(''.join(authResultOrigIP)), 'PTR')
                     for domain in authResultOrigDomain:
                         authResultOrig = domain.to_text().lower()
-                except (dns.resolver.LifetimeTimeout, dns.resolver.NoAnswer):
-                    print(f'{Fore.LIGHTRED_EX}Could not resolve the Domain Name.{Fore.RESET}')
-                    report.append(f'Could not resolve the Domain Name.')      
+                except (dns.resolver.LifetimeTimeout, dns.resolver.NoAnswer) as e:
+                    print(f'{Fore.LIGHTRED_EX}Could not resolve the Domain Name: {e}{Fore.RESET}')
+                    report.append(f'Could not resolve the Domain Name: {e}\n')      
 
                 tmp = authResultOrig.split('.')
                 authResultFullDomain = '.'.join(tmp[-3:-1])
@@ -423,12 +476,17 @@ def spoofing(eheader):
                     authResultMx = dns.resolver.resolve(authResultFullDomain, 'MX')
                     for servers in authResultMx:
                         mxAuthResult.append(servers.exchange.to_text().lower())
-                except dns.resolver.LifetimeTimeout:
-                    print(f'{Fore.LIGHTRED_EX}Could not resolve the MX Record.{Fore.RESET}')
-                    report.append(f'Could not resolve the MX Record.')
+                except dns.resolver.LifetimeTimeout as e:
+                    print(f'{Fore.LIGHTRED_EX}Could not resolve the MX Record: {e}{Fore.RESET}')
+                    report.append(f'Could not resolve the MX Record: {e}\n')
 
                 for n in mxAuthResult:
-                    aRecordsOfMxAuthResult.append(resolveIP(n))
+                    resolved_ip = resolveIP(n, passive)
+                    if resolved_ip != f'{Fore.LIGHTRED_EX}Error.{Fore.RESET}':
+                        aRecordsOfMxAuthResult.append(resolved_ip)
+                    else:
+                        print(f'{Fore.LIGHTRED_EX}Error resolving IP for Auth Result MX server: {n}{Fore.RESET}')
+                        report.append(f'Error resolving IP for Auth Result MX server: {n}\n')
                 if any(x in aRecordsOfMxAuthResult for x in aRecordsOfMx):
                     print(f'{Fore.LIGHTGREEN_EX}No Mismatch detected.{Fore.RESET}')
                     report.append(f'No Mismatch detected.')
@@ -441,9 +499,9 @@ def spoofing(eheader):
                         for spf in authResultSpf:
                             authResultSpf = spf.to_text().lower()
                             txtRecords.append(re.findall(r'"(.*?)"', authResultSpf))
-                    except dns.resolver.LifetimeTimeout:
-                        print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record.{Fore.RESET}')
-                        report.append(f'{indent}Could not resolve the SPF Record.')
+                    except dns.resolver.LifetimeTimeout as e:
+                        print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record: {e}{Fore.RESET}')
+                        report.append(f'{indent}Could not resolve the SPF Record: {e}\n')
 
                     subnetsTmp = []
                     for txt in txtRecords:
@@ -490,9 +548,9 @@ def spoofing(eheader):
                                 for spfInclude in spfResultsInclude:
                                     spfResultsInclude = spfInclude.to_text().lower()
                                     txtRecordsOfInclude.append(re.findall(r'"(.*?)"', spfResultsInclude))
-                            except dns.resolver.LifetimeTimeout:
-                                print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record.{Fore.RESET}') 
-                                report.append('Could not resolve the SPF Record.')
+                            except dns.resolver.LifetimeTimeout as e:
+                                print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record: {e}{Fore.RESET}') 
+                                report.append(f'Could not resolve the SPF Record: {e}\n')
                         
                         extractionSecondLevel = [y for subsublist in txtRecordsOfInclude for y in subsublist]
                         extractionSecondLevel = [technique for idontknow in extractionSecondLevel for technique in idontknow.split()]
@@ -507,9 +565,9 @@ def spoofing(eheader):
                                 for p in resultsOfInclude:
                                     includeResults = p.to_text().lower()
                                     txtRecordOfIncludeSecond.append(re.findall(r'"(.*?)"', includeResults))
-                            except dns.resolver.LifetimeTimeout:
-                                print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record.{Fore.RESET}')  
-                                report.append('Could not resolve the SPF Record.')
+                            except dns.resolver.LifetimeTimeout as e:
+                                print(f'{Fore.LIGHTRED_EX}Could not resolve the SPF Record: {e}{Fore.RESET}')  
+                                report.append(f'Could not resolve the SPF Record: {e}\n')
 
                         subnetsOfInclude = []
                         for b in txtRecordOfIncludeSecond:
@@ -614,39 +672,40 @@ def spoofing(eheader):
     report.append('\n\nChecking with VirusTotal...\n')
 
     if filteredIpv4:
-        print(f'Detections: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/detection{Fore.RESET}')
-        print(f'Relations: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/relations{Fore.RESET}')
-        print(f'Graph: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/graph{Fore.RESET}')
-        print(f'Network Traffic: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/network-traffic{Fore.RESET}')
-        print(f'WHOIS: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/whois{Fore.RESET}')
-        print(f'Comments: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/comments{Fore.RESET}')
-        print(f'Votes: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/votes{Fore.RESET}')
+        for ip in filteredIpv4:
+            print(f'Detections: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/detection{Fore.RESET}')
+            print(f'Relations: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/relations{Fore.RESET}')
+            print(f'Graph: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/graph{Fore.RESET}')
+            print(f'Network Traffic: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/network-traffic{Fore.RESET}')
+            print(f'WHOIS: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/whois{Fore.RESET}')
+            print(f'Comments: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/comments{Fore.RESET}')
+            print(f'Votes: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/votes{Fore.RESET}')
 
-        report.append(f'Detections: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/detection\n')
-        report.append(f'Relations: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/relations\n')
-        report.append(f'Graph: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/graph\n')
-        report.append(f'Network Traffic: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/network-traffic\n')
-        report.append(f'WHOIS: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/whois\n')
-        report.append(f'Comments: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/comments\n')
-        report.append(f'Votes: https://www.virustotal.com/gui/ip-address/{filteredIpv4[0]}/votes\n')
-
+            report.append(f'Detections: https://www.virustotal.com/gui/ip-address/{ip}/detection\n')
+            report.append(f'Relations: https://www.virustotal.com/gui/ip-address/{ip}/relations\n')
+            report.append(f'Graph: https://www.virustotal.com/gui/ip-address/{ip}/graph\n')
+            report.append(f'Network Traffic: https://www.virustotal.com/gui/ip-address/{ip}/network-traffic\n')
+            report.append(f'WHOIS: https://www.virustotal.com/gui/ip-address/{ip}/whois\n')
+            report.append(f'Comments: https://www.virustotal.com/gui/ip-address/{ip}/comments\n')
+            report.append(f'Votes: https://www.virustotal.com/gui/ip-address/{ip}/votes\n')
 
     elif authResultOrigIP:
-        print(f'Detections: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/detection{Fore.RESET}')
-        print(f'Relations: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/relations{Fore.RESET}')
-        print(f'Graph: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/graph{Fore.RESET}')
-        print(f'Network Traffic: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/network-traffic{Fore.RESET}')
-        print(f'WHOIS: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/whois{Fore.RESET}')
-        print(f'Comments: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/comments{Fore.RESET}')
-        print(f'Votes: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/votes{Fore.RESET}')
+        for ip in authResultOrigIP:
+            print(f'Detections: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/detection{Fore.RESET}')
+            print(f'Relations: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/relations{Fore.RESET}')
+            print(f'Graph: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/graph{Fore.RESET}')
+            print(f'Network Traffic: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/network-traffic{Fore.RESET}')
+            print(f'WHOIS: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/whois{Fore.RESET}')
+            print(f'Comments: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/comments{Fore.RESET}')
+            print(f'Votes: {Fore.LIGHTGREEN_EX}https://www.virustotal.com/gui/ip-address/{ip}/votes{Fore.RESET}')
 
-        report.append(f'Detections: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/detection\n')
-        report.append(f'Relations: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/relations\n')
-        report.append(f'Graph: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/graph\n')
-        report.append(f'Network Traffic: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/network-traffic\n')
-        report.append(f'WHOIS: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/whois\n')
-        report.append(f'Comments: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/comments\n')
-        report.append(f'Votes: https://www.virustotal.com/gui/ip-address/{authResultOrigIP[0]}/votes\n')
+            report.append(f'Detections: https://www.virustotal.com/gui/ip-address/{ip}/detection\n')
+            report.append(f'Relations: https://www.virustotal.com/gui/ip-address/{ip}/relations\n')
+            report.append(f'Graph: https://www.virustotal.com/gui/ip-address/{ip}/graph\n')
+            report.append(f'Network Traffic: https://www.virustotal.com/gui/ip-address/{ip}/network-traffic\n')
+            report.append(f'WHOIS: https://www.virustotal.com/gui/ip-address/{ip}/whois\n')
+            report.append(f'Comments: https://www.virustotal.com/gui/ip-address/{ip}/comments\n')
+            report.append(f'Votes: https://www.virustotal.com/gui/ip-address/{ip}/votes\n')
     else:
         print(f'{Fore.WHITE}Could not detect SMTP Server. Manual reviewing required.{Fore.RESET}')
         report.append(f'Could not detect SMTP Server. Manual reviewing required.')
@@ -655,12 +714,14 @@ def spoofing(eheader):
     report.append('\nChecking with AbuseIPDB...\n')
 
     if filteredIpv4:
-        print(f'AbuseIPDB: {Fore.LIGHTGREEN_EX}https://www.abuseipdb.com/check/{filteredIpv4[0]}{Fore.RESET}')
-        report.append(f'AbuseIPDB: https://www.abuseipdb.com/check/{filteredIpv4[0]}')
+        for ip in filteredIpv4:
+            print(f'AbuseIPDB: {Fore.LIGHTGREEN_EX}https://www.abuseipdb.com/check/{ip}{Fore.RESET}')
+            report.append(f'AbuseIPDB: https://www.abuseipdb.com/check/{ip}\n')
         
     elif authResultOrigIP:
-        print(f'AbuseIPDB: {Fore.LIGHTGREEN_EX}https://www.abuseipdb.com/check/{authResultOrigIP[0]}{Fore.RESET}')
-        report.append(f'AbuseIPDB: https://www.abuseipdb.com/check/{authResultOrigIP[0]}')
+        for ip in authResultOrigIP:
+            print(f'AbuseIPDB: {Fore.LIGHTGREEN_EX}https://www.abuseipdb.com/check/{ip}{Fore.RESET}')
+            report.append(f'AbuseIPDB: https://www.abuseipdb.com/check/{ip}\n')
     
     else:
         print(f'{Fore.WHITE}Could not detect SMTP Server. Manual reviewing required.{Fore.RESET}')
@@ -670,17 +731,20 @@ def spoofing(eheader):
     report.append('\n\nChecking with IPQualityScore...\n')
 
     if filteredIpv4:
-        print(f'IPQualityScore: {Fore.LIGHTGREEN_EX}https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{filteredIpv4[0]}{Fore.RESET}')
-        report.append(f'IPQualityScore: https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{filteredIpv4[0]}')
+        for ip in filteredIpv4:
+            print(f'IPQualityScore: {Fore.LIGHTGREEN_EX}https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{ip}{Fore.RESET}')
+            report.append(f'IPQualityScore: https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{ip}\n')
 
     elif authResultOrigIP:
-        print(f'IPQualityScore: {Fore.LIGHTGREEN_EX}https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{authResultOrigIP[0]}{Fore.RESET}')
-        report.append(f'IPQualityScore: https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{authResultOrigIP[0]}')
+        for ip in authResultOrigIP:
+            print(f'IPQualityScore: {Fore.LIGHTGREEN_EX}https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{ip}{Fore.RESET}')
+            report.append(f'IPQualityScore: https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/{ip}\n')
     else:
         print(f'{Fore.WHITE}Could not detect SMTP Server. Manual reviewing required.{Fore.RESET}')
         report.append(f'Could not detect SMTP Server. Manual reviewing required.')
     
     return ''.join(report)
+
 
 def check_attachment(attachment):
     result = []
@@ -767,6 +831,7 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--version', action='version', version=f'Elyzer {CURRENT_VERSION}')
     parser.add_argument('-a', '--attachment', help='Check if the file is malicious.')
     parser.add_argument('-j', '--json', help='Generate report in JSON format', action='store_true')
+    parser.add_argument('--passive', help='Enable passive mode to skip DNS resolution', action='store_true')
     args = parser.parse_args()
 
     if args.file is not None:  
@@ -776,12 +841,12 @@ if __name__ == '__main__':
             with open(f'elyzer_report_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.txt', 'w', encoding='UTF-8') as report:
                 report.write(f'Elyzer {CURRENT_VERSION}\n' + 'Author: B0lg0r0v\n' + 'https://arthurminasyan.com\n\n' +  generalInformation(args.file) + 
                             '\n' + routing(args.file) + '\n' + securityInformations(args.file) + 
-                            '\n' + envelope(args.file) + '\n' + spoofing(args.file) + '\n' + check_attachment(args.attachment)) 
+                            '\n' + envelope(args.file) + '\n' + spoofing(args.file, args.passive) + '\n' + check_attachment(args.attachment)) 
         else:
             with open(f'elyzer_report_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.txt', 'w', encoding='UTF-8') as report:
                 report.write(f'Elyzer {CURRENT_VERSION}\n' + 'Author: B0lg0r0v\n' + 'https://arthurminasyan.com\n\n' +  generalInformation(args.file) + 
                             '\n' + routing(args.file) + '\n' + securityInformations(args.file) + 
-                            '\n' + envelope(args.file) + '\n' + spoofing(args.file))
+                            '\n' + envelope(args.file) + '\n' + spoofing(args.file, args.passive))
 
         if args.json:
             generate_json_report(args.file, args.attachment)
@@ -789,3 +854,4 @@ if __name__ == '__main__':
         print(f'\n\n\n{Fore.GREEN}-----> Report saved as "elyzer_report_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.txt"{Fore.RESET}')
     else:
         parser.error('E-Mail Header is required.')
+
